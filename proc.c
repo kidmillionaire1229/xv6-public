@@ -6,6 +6,7 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "elf.h"
 
 struct {
   struct spinlock lock;
@@ -88,6 +89,10 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+
+  // 우선 순위와 실행 횟수를 초기화한다. 
+  p->priority = 5;
+  p->exec_count = 0;
 
   release(&ptable.lock);
 
@@ -200,6 +205,8 @@ fork(void)
   np->parent = curproc;
   *np->tf = *curproc->tf;
 
+  np->priority = curproc->priority;
+
   // Clear %eax so that fork returns 0 in the child.
   np->tf->eax = 0;
 
@@ -219,6 +226,133 @@ fork(void)
   release(&ptable.lock);
 
   return pid;
+}
+
+int forknexec(const char* path, const char **args)
+{
+  int i;
+  struct proc *new_process;
+  struct proc *current_process = myproc();
+
+  // Allocate process.
+  if((new_process = allocproc()) == 0){
+    return -2;
+  }
+
+  new_process->parent = current_process;
+  *new_process->tf = *current_process->tf;
+
+  // 부모 프로세스의 priority와 같게  변수 할당 
+  new_process->priority = current_process->priority;
+
+  for(i = 0; i < NOFILE; i++)
+    if(current_process->ofile[i])
+      new_process->ofile[i] = filedup(current_process->ofile[i]);
+  new_process->cwd = idup(current_process->cwd);
+
+  char *s, *last;
+  int off;
+  uint argc, sz, sp, ustack[3+MAXARG+1];
+  struct elfhdr elf;
+  struct inode *ip;
+  struct proghdr ph;
+  pde_t *pgdir;
+
+  begin_op();
+
+  if((ip = namei((char *)path)) == 0){
+    end_op();
+    return -1;
+  }
+  ilock(ip);
+  pgdir = 0;
+
+  // Check ELF header
+  if(readi(ip, (char*)&elf, 0, sizeof(elf)) != sizeof(elf))
+    goto bad;
+  if(elf.magic != ELF_MAGIC)
+    goto bad;
+
+  if((pgdir = setupkvm()) == 0)
+    goto bad;
+
+  // Load program into memory.
+  sz = 0;
+  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+    if(readi(ip, (char*)&ph, off, sizeof(ph)) != sizeof(ph))
+      goto bad;
+    if(ph.type != ELF_PROG_LOAD)
+      continue;
+    if(ph.memsz < ph.filesz)
+      goto bad;
+    if(ph.vaddr + ph.memsz < ph.vaddr)
+      goto bad;
+    if((sz = allocuvm(pgdir, sz, ph.vaddr + ph.memsz)) == 0)
+      goto bad;
+    if(ph.vaddr % PGSIZE != 0)
+      goto bad;
+    if(loaduvm(pgdir, (char*)ph.vaddr, ip, ph.off, ph.filesz) < 0)
+      goto bad;
+  }
+  iunlockput(ip);
+  end_op();
+  ip = 0;
+
+  // Allocate two pages at the next page boundary.
+  // Make the first inaccessible.  Use the second as the user stack.
+  sz = PGROUNDUP(sz);
+  if((sz = allocuvm(pgdir, sz, sz + 2*PGSIZE)) == 0)
+    goto bad;
+  clearpteu(pgdir, (char*)(sz - 2*PGSIZE));
+  sp = sz;
+
+  // Push argument strings, prepare rest of stack in ustack.
+  for(argc = 0; args[argc]; argc++) {
+    if(argc >= MAXARG)
+      return -1;
+    sp = (sp - (strlen(args[argc]) + 1)) & ~3;
+    if(copyout(pgdir, sp, (void *)args[argc], strlen(args[argc]) + 1) < 0)
+      goto bad;
+    ustack[3+argc] = sp;
+  }
+  ustack[3+argc] = 0;
+
+  ustack[0] = 0xffffffff;  // fake return PC
+  ustack[1] = argc;
+  ustack[2] = sp - (argc+1)*4;  // argv pointer
+
+  sp -= (3+argc+1) * 4;
+  if(copyout(pgdir, sp, ustack, (3+argc+1)*4) < 0)
+    goto bad;
+
+  // Save program name for debugging.
+  for(last=s=(char *)path; *s; s++)
+    if(*s == '/')
+      last = s+1;
+  safestrcpy(new_process->name, last, sizeof(new_process->name));
+
+  // Commit to the user image.
+  new_process->pgdir = pgdir;
+  new_process->sz = sz;
+  new_process->tf->eip = elf.entry;  // main
+  new_process->tf->esp = sp;
+  switchuvm(new_process);
+
+  acquire(&ptable.lock);
+  new_process->state = RUNNABLE;
+  release(&ptable.lock);
+
+  yield();
+  return wait();
+  
+ bad:
+  if(pgdir)
+    freevm(pgdir);
+  if(ip){
+    iunlockput(ip);
+    end_op();
+  }
+  return -2;
 }
 
 // Exit the current process.  Does not return.
@@ -311,37 +445,80 @@ wait(void)
   }
 }
 
+#define INT_MAX 2147483647
+
+struct proc *schedule_with_priority()
+{
+    long long priority; 
+    int priority_min = INT_MAX;
+
+    struct proc *selec_proc = 0;
+
+    for (struct proc *p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+        if (p->state != RUNNABLE)
+            continue;
+        
+        //현재 프로세스의 priority와 실행 횟수를 더함으로써, priority 갱신 
+        priority = (long long)p->priority + p->exec_count;
+
+        //priority가 INT_MAX 보다 크다면 INT_MAX값으로 설정 
+        priority = (priority > INT_MAX) ? INT_MAX : priority;
+
+        //현재까지의 priority의 최소값과 비교해서, 현재 process의 priority가 더 작다면, 최소값 갱신  
+        //스케줄링에서 선택되어야할 프로세스인 selec_proc에 해당 프로세스를 할당 및 갱신 
+        if (priority_min > priority){
+            priority_min = priority;
+            selec_proc = p;
+        }
+    }
+    //for문이 끝나면, 가장 높은 우선 순위(priority값은 최소)를 가진 process를 반환한다. 
+    return selec_proc;
+}
+
+
 //PAGEBREAK: 42
-// Per-CPU process scheduler.
+// Per-CPU process scheduler.534
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
 //  - choose a process to run
 //  - swtch to start running that process
-//  - eventually that process transfers control
+//  - eventually that process transfers c/ontrol
 //      via swtch back to the scheduler.
-void
-scheduler(void)
+void scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
   c->proc = 0;
-  
-  for(;;){
-    // Enable interrupts on this processor.
-    sti();
 
-    // Loop over process table looking for process to run.
-    acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
+  for (;;){
+      //현재 프로세스에 인터럽트 개입이 가능하게 함
+      sti();   
+    
+      //우선 순위 기반 스케줄링 후, 우선순위가 가장 높은 프로세스 반환 
+      struct proc *selec_proc = schedule_with_priority();
+      if (selec_proc==0)
+          continue;
 
+      // Loop over process table looking for process to run.
+      acquire(&ptable.lock);
+
+      for (p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+          if (p->state != RUNNABLE)
+              continue;
+          
+          //RUNNABLE한 process와 위에서 찾은 우선순위가 가장 높은 프로세스가 일치하지 않는다면, 다시 for문 수행 
+          if (selec_proc != p)
+              continue;
+      
       // Switch to chosen process.  It is the process's job
       // to release ptable.lock and then reacquire it
       // before jumping back to us.
       c->proc = p;
       switchuvm(p);
+
       p->state = RUNNING;
+      //해당 프로세스의 실행한 횟수를 1 증가하여, 실행한 횟수를 기록하게 한다. 
+      p->exec_count++;
 
       swtch(&(c->scheduler), p->context);
       switchkvm();
@@ -349,9 +526,8 @@ scheduler(void)
       // Process is done running for now.
       // It should have changed its p->state before coming back.
       c->proc = 0;
-    }
-    release(&ptable.lock);
-
+      }
+      release(&ptable.lock);
   }
 }
 
@@ -531,4 +707,36 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+int set_proc_priority(int pid, int priority)
+{
+    struct proc *p;
+    
+    if(priority>10 || priority<1){
+       cprintf("priority out of boundary\n");
+       exit();
+    }
+
+    for (p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+        if(p->pid == pid){
+            acquire(&ptable.lock);
+            p->priority = priority;
+            release(&ptable.lock);
+            return p->priority;
+        }
+    }
+    return -1;
+}
+
+int get_proc_priority(int pid)
+{
+    struct proc *p;
+
+    for (p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+        if (p->pid == pid){
+            return p->priority;
+        }
+    }
+    return -1;
 }

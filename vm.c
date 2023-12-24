@@ -318,7 +318,6 @@ copyuvm(pde_t *pgdir, uint sz)
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
@@ -327,22 +326,36 @@ copyuvm(pde_t *pgdir, uint sz)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
+    
+    //Write 권한 없앰 
+    *pte &= (~PTE_W);
+    
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+
+    //삭제 : 메모리 공간 새로 할당 및 복사 코드 
+    /*if((mem = kalloc()) == 0)
       goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    memmove(mem, (char*)P2V(pa), PGSIZE);*/
+    
+    if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0) {
+        //삭제 : 기존 물리 메모리를 사용하기 때문 
+        //kfree(mem);
+        goto bad;
     }
+    //자녀가 참조하므로 inc_refcount 호출하여, reference counter증가 
+    inc_refcount(pa);
   }
+  //TLB flush 
+  lcr3(V2P(pgdir));
   return d;
 
-bad:
-  freevm(d);
-  return 0;
+    bad:
+        freevm(d);
+        return 0;
 }
+
+
 
 //PAGEBREAK!
 // Map user virtual address to kernel address.
@@ -385,10 +398,50 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   return 0;
 }
 
+void 
+pagefault(void)
+{
+  pte_t *pte;
+  uint rc, pa, va;
+  //rcr2() 함수를 호출하여, page fault가 발생한 VA 읽어 들임 
+  va = rcr2(); 
+  if(va < 0){
+    panic("wrong va\n");
+    return;
+  }
+  
+  //VA가 속한 Page table entry를 가져온다. 
+  pte = walkpgdir(myproc()->pgdir, (void*)va, 0);
+  //PA 반환 
+  pa = PTE_ADDR(*pte);
+
+  //refcount 조회
+  rc = get_refcount(pa);
+
+  if(rc > 1){
+    char* mem;
+    //새로운 페이지 할당 
+    mem = kalloc();
+    if(mem == 0) return;
+    //복사 
+    memmove(mem, (char*)P2V(pa), PGSIZE);
+    //새로운 physical memory공간에 대한 Page table entry 수정 
+    *pte = V2P(mem) | PTE_P | PTE_U | PTE_W;
+    //새로운 페이지를 할당하기 때문에, reference counter은 감소 
+    dec_refcount(pa);
+  }
+  else if(rc == 1){
+    //현재 pte에 write권한만 추가 
+    *pte |= PTE_W;
+  }
+  //TLB Flush 
+  lcr3(V2P(myproc()->pgdir));
+}
+
 //PAGEBREAK!
 // Blank page.
 //PAGEBREAK!
 // Blank page.
 //PAGEBREAK!
-// Blank page.
+// Blankpage.
 
